@@ -1,0 +1,21 @@
+# This file specifies files that are *NOT* uploaded to Google Cloud when
+# you deploy your application.
+
+.gcloudignore
+
+# Python virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Git files
+.git
+.gitignore
+
+# Test files and local configurations
+test_app/
+*.md
+.DS_Store
+.vscode/

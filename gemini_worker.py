@@ -3,62 +3,137 @@ import json
 import sys
 import re
 import google.generativeai as genai
+import base64
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import google.api_core.exceptions
 
-# This script can perform two tasks:
-# 1. "generate_plan": Reads webpage content and creates a plan for the main app.
-# 2. "extract_answer": Reads content and a question, and extracts the answer.
+# Configure logging for the worker to flush immediately
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stderr)
+    ]
+)
 
-def get_gemini_model():
-    """Initializes and returns the Gemini model."""
+# Ensure the StreamHandler flushes immediately
+for handler in logging.root.handlers:
+    if isinstance(handler, logging.StreamHandler):
+        handler.flush = sys.stderr.flush
+
+# Define retry strategy for Gemini API calls
+# We retry on specific Gemini API errors or blocked prompts (e.g., token limits or safety issues)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+       retry=retry_if_exception_type((genai.types.BlockedPromptException, google.api_core.exceptions.GoogleAPICallError)))
+def _generate_content_with_retry(model, prompt):
+    return model.generate_content(prompt)
+
+def get_gemini_model(model_name: str = None):
+
+    """Initializes and returns the Gemini model. Optionally, specify a model name."""
+
     gemini_api_key = os.environ.get('GEMINI_API_KEY')
     if not gemini_api_key:
+        logging.error("GEMINI_API_KEY environment variable is not set.")
         raise ValueError("GEMINI_API_KEY is not set.")
+    else:
+        logging.info("GEMINI_API_KEY is set.")
+
     genai.configure(api_key=gemini_api_key)
 
-    latest_version = -1.0
     model_to_use = None
-    for model in genai.list_models():
-        if 'generateContent' in model.supported_generation_methods:
-            match = re.search(r'gemini-(\d+\.?\d*)-pro', model.name)
-            if match:
-                version = float(match.group(1))
-                if version > latest_version:
-                    latest_version = version
-                    model_to_use = model.name
+    if model_name:
+        logging.info(f"Attempting to use specified Gemini model: {model_name}")
+        try:
+            model_info = genai.get_model(model_name)
+            if 'generateContent' not in model_info.supported_generation_methods:
+                logging.warning(f"Model {model_name} does not support generateContent. Falling back to default selection.")
+                model_name = None # Fallback to default selection below
+            else:
+                model_to_use = model_name
+        except Exception as e:
+            logging.warning(f"Could not get model {model_name}. Falling back to default selection. Error: {e}")
+            model_name = None
+
     if not model_to_use:
-        raise RuntimeError("Could not find a suitable Gemini Pro model.")
+        logging.info("No specific model_name provided or specified model not suitable. Finding latest gemini-pro.")
+        latest_version = -1.0
+        for model in genai.list_models():
+            if 'generateContent' in model.supported_generation_methods:
+                match = re.search(r'gemini-(\d+\.?\d*)-pro', model.name)
+                if match:
+                    version = float(match.group(1))
+                    if version > latest_version:
+                        latest_version = version
+                        model_to_use = model.name
+        if not model_to_use:
+            logging.error("Could not find a suitable Gemini Pro model.")
+            raise RuntimeError("Could not find a suitable Gemini Pro model.")
+        logging.info(f"Selected Gemini model: {model_to_use}")
     
-    return genai.GenerativeModel(model_to_use)
+    logging.info(f"Initializing Gemini model: {model_to_use}")
+    try:
+        return genai.GenerativeModel(model_to_use)
+    except Exception as e:
+        logging.error(f"Failed to instantiate Gemini model {model_to_use}: {e}")
+        return None
 
 def generate_plan(quiz_content: str, initial_payload: dict):
-    """Generates a JSON plan based on the webpage content."""
+    logging.info("Entering generate_plan function.")
     model = get_gemini_model()
+    if model is None:
+        logging.error("Gemini model initialization failed: get_gemini_model returned None for generate_plan.")
+        raise RuntimeError("Gemini model initialization failed.")
     initial_payload_str = json.dumps(initial_payload, indent=2)
     prompt = f"""
-    You are an intelligent agent. Your task is to analyze the webpage content below and create a JSON plan to solve the described task.
-    You must use the provided "Initial JSON Payload" to fill in any required data.
+    You are an intelligent agent tasked with solving a multi-step challenge presented on a webpage. Your goal is to analyze the provided HTML content and create a JSON plan to accomplish the main objective.
 
-    Analyze the task and respond ONLY with a JSON object with a single key "plan".
-    The "plan" object should contain:
-    1.  `task_type`: A string describing the task ("fetch_and_submit" or "single_post").
-    2.  `fetch_url`: (For "fetch_and_submit") The full URL to fetch data from. 
-        - CRITICAL: If you see an <audio> or <video> tag, this URL MUST be the value of its `src` attribute. Resolve it to a full URL if it's relative.
-        - If you see a link to a data file (.csv, .json, etc.), use that URL.
-        - IMPORTANT: Do not assume a directory structure. If a URL looks like `https://example.com/data?id=123`, the data is at `https://example.com/data?id=123`, not `https://example.com/data/index.csv?id=123`.
-    3.  `processing_task`: (Optional) E.g., "sum_numbers_in_csv", "extract_secret_code", "transcribe_audio".
-        - If the `fetch_url` points to an audio or video file, set this to "transcribe_audio".
-    4.  `submit_url`: The full URL to POST the final payload to.
-    5.  `payload`: The JSON payload to be submitted, using "__ANSWER__" as a placeholder for processed data.
+    **Instructions:**
+
+    1.  **Analyze the Entire Context:** Read the text, look at all links (`<a>` tags), and identify any embedded media (`<audio>`, `<video>`). The solution may require combining information from the text with data from a linked file (e.g., a CSV, PDF) or transcribed media.
+    2.  **Determine the Primary Action:** Decide on the single most important action needed to solve the task. This usually involves fetching and processing data from a URL.
+    3.  **Formulate a Plan:** Respond ONLY with a JSON object with a single key "plan". This object must contain:
+        *   `task_type`: Usually "fetch_and_submit" if you need to get data from a URL.
+        *   `fetch_url`: The single, most relevant URL to fetch for this step of the task. This could be an audio file for transcription, a CSV for calculation, a PDF for information extraction, etc.
+        *   `processing_task`: A concise description of what needs to be done with the data from `fetch_url` to find the answer. 
+            *CRITICAL*: If this task involves a *numerical computation* (e.g., summing, counting, averaging numbers in a file), the `processing_task` MUST follow a precise, machine-readable format for local processing. Examples:
+            - For summing CSV values greater than a threshold: `sum_csv_values_greater_than_<NUMBER>` (e.g., `sum_csv_values_greater_than_17660`)
+            - For other computational tasks, define a similarly structured, explicit format. If no specific local processor exists yet, default to `extract_value_X_from_content`.
+            For non-computational tasks (e.g., audio transcription, general text extraction), use a descriptive phrase like "transcribe_audio_to_find_the_secret_code" or "find_the_name_of_the_CEO_in_the_PDF".
+        *   `submit_url`: The full URL where the final answer should be POSTed.
+        *   `payload`: The JSON payload for the submission, using "__ANSWER__" as a placeholder for the result of the `processing_task`.
+
+    **Your Context:**
+    - You will be provided with the "Initial JSON Payload" which contains necessary data like your email and the current URL.
+    - You will be provided with the full "Webpage Content (HTML)".
+
+    **Example Scenario:**
+    - If the page says "Transcribe the audio to find the password" and provides an `<audio src="file.opus">` tag, your `fetch_url` should be the absolute URL to `file.opus` and the `processing_task` should be "transcribe_audio_to_find_the_password".
+    - If the page says "Sum the numbers in column 'value' from the attached document" and provides an `<a href="data.csv">` link, your `fetch_url` should be the absolute URL to `data.csv` and the `processing_task` should be "sum_the_numbers_in_column_value_from_the_csv".
 
     Initial JSON Payload (Your context): --- {initial_payload_str} ---
     Webpage Content (Your instructions): --- {quiz_content} ---
     """
-    response = model.generate_content(prompt)
+    logging.info(f"Prompt for generate_plan (truncated to 500 chars): {prompt[:500]}")
+    try:
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from Gemini API (generate_plan): {response.text[:500]}")
+    except (genai.types.BlockedPromptException, google.api_core.exceptions.GoogleAPICallError) as e:
+        logging.warning(f"Primary model failed ({e}). Attempting fallback to gemini-2.5-flash-lite.")
+        model = get_gemini_model(model_name="gemini-2.5-flash-lite")
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from fallback Gemini API (generate_plan): {response.text[:500]}")
+
+    logging.info("Exiting generate_plan function.")
     return json.dumps({"llm_response": response.text})
 
 def extract_answer(content: str, question: str):
-    """Extracts a specific answer from content based on a question."""
+    logging.info("Entering extract_answer function.")
     model = get_gemini_model()
+    if model is None:
+        logging.error("Gemini model initialization failed: get_gemini_model returned None for extract_answer.")
+        raise RuntimeError("Gemini model initialization failed.")
     prompt = f"""
     You are an expert at finding specific information. Analyze the following content and answer the question.
     Respond with ONLY the answer, and nothing else. Do not add any formatting or explanations.
@@ -71,12 +146,25 @@ def extract_answer(content: str, question: str):
     {question}
     ---
     """
-    response = model.generate_content(prompt)
+    logging.info(f"Prompt for extract_answer (truncated to 500 chars): {prompt[:500]}")
+    try:
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from Gemini API (extract_answer): {response.text[:500]}")
+    except (genai.types.BlockedPromptException, google.api_core.exceptions.GoogleAPICallError) as e:
+        logging.warning(f"Primary model failed ({e}). Attempting fallback to gemini-2.5-flash-latest.")
+        model = get_gemini_model(model_name="gemini-2.5-flash-latest")
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from fallback Gemini API (extract_answer): {response.text[:500]}")
+
+    logging.info("Exiting extract_answer function.")
     return json.dumps({"answer": response.text.strip()})
 
 def process_data(data_content: str, processing_task: str):
-    """Processes raw data using the LLM based on a specific task."""
+    logging.info("Entering process_data function.")
     model = get_gemini_model()
+    if model is None:
+        logging.error("Gemini model initialization failed: get_gemini_model returned None for process_data.")
+        raise RuntimeError("Gemini model initialization failed.")
     prompt = f"""
     You are a data processing specialist. Perform the following task on the given data.
     Respond with ONLY the final result, and nothing else. Do not add any formatting, explanations, or quotes.
@@ -89,7 +177,45 @@ def process_data(data_content: str, processing_task: str):
     {processing_task}
     ---
     """
-    response = model.generate_content(prompt)
+    logging.info(f"Prompt for process_data (truncated to 500 chars): {prompt[:500]}")
+    try:
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from Gemini API (process_data): {response.text[:500]}")
+    except (genai.types.BlockedPromptException, google.api_core.exceptions.GoogleAPICallError) as e:
+        logging.warning(f"Primary model failed ({e}). Attempting fallback to gemini-2.5-flash-latest.")
+        model = get_gemini_model(model_name="gemini-2.5-flash-latest")
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from fallback Gemini API (process_data): {response.text[:500]}")
+
+    logging.info("Exiting process_data function.")
+    return json.dumps({"processed_data": response.text.strip()})
+
+def process_audio_with_gemini(audio_content: bytes, processing_task: str):
+    logging.info("Entering process_audio_with_gemini function.")
+    model = get_gemini_model()
+    if model is None:
+        logging.error("Gemini model initialization failed: get_gemini_model returned None for process_audio_with_gemini.")
+        raise RuntimeError("Gemini model initialization failed.")
+    
+    audio_part = {
+        "mime_type": "audio/ogg",
+        "data": audio_content
+    }
+
+    prompt = [audio_part, f"Analyze the provided audio and {processing_task}. Respond with ONLY the final answer, and nothing else."]
+    logging.info(f"Prompt for process_audio_with_gemini (text part truncated to 500 chars): {prompt[1][:500]}")
+    logging.info(f"Audio content size for process_audio_with_gemini: {len(audio_content)} bytes.")
+
+    try:
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from Gemini API (process_audio_with_gemini): {response.text[:500]}")
+    except (genai.types.BlockedPromptException, google.api_core.exceptions.GoogleAPICallError) as e:
+        logging.warning(f"Primary model failed ({e}). Attempting fallback to gemini-2.5-flash-latest.")
+        model = get_gemini_model(model_name="gemini-2.5-flash-latest")
+        response = _generate_content_with_retry(model, prompt)
+        logging.info(f"Received response from fallback Gemini API (process_audio_with_gemini): {response.text[:500]}")
+
+    logging.info("Exiting process_audio_with_gemini function.")
     return json.dumps({"processed_data": response.text.strip()})
 
 if __name__ == "__main__":
@@ -107,6 +233,12 @@ if __name__ == "__main__":
             
         elif task == "process_data":
             result_json = process_data(input_data["data_content"], input_data["processing_task"])
+            print(result_json)
+        
+        elif task == "process_audio_with_gemini":
+            audio_content_base64 = input_data["audio_content"]
+            audio_bytes = base64.b64decode(audio_content_base64)
+            result_json = process_audio_with_gemini(audio_bytes, input_data["processing_task"])
             print(result_json)
 
         else:
