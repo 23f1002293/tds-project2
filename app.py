@@ -102,6 +102,18 @@ async def homepage(request):
                     processed_html = str(soup)
                     logging.info(f"--- Processed HTML with Absolute URLs ---\n{processed_html[:1000]}\n---------------------------------")
 
+                    # Extract audio/video URLs
+                    media_urls = []
+                    for tag in soup.find_all(['audio', 'video']):
+                        if tag.get('src'):
+                            media_url = urljoin(current_url, tag['src'])
+                            media_urls.append(media_url)
+                    
+                    if media_urls:
+                        logging.info(f"Found media URLs: {media_urls}")
+                    else:
+                        logging.info("No media URLs found on the page.")
+
                     await browser.close()
                 logging.info("D: Playwright operations completed successfully.")
 
@@ -109,7 +121,8 @@ async def homepage(request):
                 worker_input = json.dumps({
                     "task": "generate_plan",
                     "quiz_content": processed_html.strip(),
-                    "initial_payload": {"email": email, "secret": secret, "url": current_url}
+                    "initial_payload": {"email": email, "secret": secret, "url": current_url},
+                    "media_urls": media_urls
                 }).encode('utf-8')
 
                 python_executable = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python")

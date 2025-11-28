@@ -7,6 +7,9 @@ import base64
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import google.api_core.exceptions
+import httpx # Import httpx for media downloading
+import mimetypes # Import mimetypes for media type detection
+import asyncio # Import asyncio for running async functions
 
 # Configure logging for the worker to flush immediately
 logging.basicConfig(
@@ -79,12 +82,50 @@ def get_gemini_model(model_name: str = None):
         logging.error(f"Failed to instantiate Gemini model {model_to_use}: {e}")
         return None
 
-def generate_plan(quiz_content: str, initial_payload: dict):
+async def generate_plan(quiz_content: str, initial_payload: dict, media_urls: list = None):
     logging.info("Entering generate_plan function.")
     model = get_gemini_model()
     if model is None:
         logging.error("Gemini model initialization failed: get_gemini_model returned None for generate_plan.")
         raise RuntimeError("Gemini model initialization failed.")
+    additional_context = ""
+    if media_urls:
+        logging.info(f"Processing {len(media_urls)} media URLs.")
+        async with httpx.AsyncClient() as client:
+            for media_url in media_urls:
+                try:
+                    logging.info(f"Fetching media from: {media_url}")
+                    response = await client.get(media_url)
+                    response.raise_for_status()  # Raise an exception for HTTP errors
+                    media_content = response.content
+                    mime_type, _ = mimetypes.guess_type(media_url)
+                    if not mime_type: # Fallback for unknown types
+                        mime_type = 'application/octet-stream'
+                    
+                    logging.info(f"Successfully fetched media ({len(media_content)} bytes, type: {mime_type}) from {media_url}")
+                    
+                    # Send media to multimodal LLM for clue extraction
+                    # Using gemini-1.5-pro for multimodal capabilities (audio/video)
+                    multimodal_model = get_gemini_model(model_name="gemini-1.5-pro") 
+                    if multimodal_model is None:
+                        logging.warning("Multimodal model (gemini-1.5-pro) not available, skipping media analysis for this URL.")
+                        continue
+
+                    media_part = {"mime_type": mime_type, "data": media_content}
+                    multimodal_prompt = [media_part, "Analyze this media for any clues, secrets, or important information related to a multi-step task or quiz. Extract any text, codes, or instructions. Respond concisely with only the extracted clue."]
+                    logging.info(f"Sending media to multimodal LLM. Prompt (text part truncated to 100 chars): {multimodal_prompt[1][:100]}")
+
+                    multimodal_response = _generate_content_with_retry(multimodal_model, multimodal_prompt)
+                    clue = multimodal_response.text.strip()
+                    if clue:
+                        additional_context += f"\n\nClue from {media_url}: {clue}"
+                        logging.info(f"Extracted clue from media: {clue[:100]}")
+                    else:
+                        logging.info(f"No clue extracted from media: {media_url}")
+
+                except Exception as e:
+                    logging.error(f"Error processing media {media_url}: {e}")
+
     initial_payload_str = json.dumps(initial_payload, indent=2)
     prompt = f"""
     You are an intelligent agent tasked with solving a multi-step challenge presented on a webpage. Your goal is to analyze the provided HTML content and create a JSON plan to accomplish the main objective.
@@ -107,6 +148,7 @@ def generate_plan(quiz_content: str, initial_payload: dict):
     **Your Context:**
     - You will be provided with the "Initial JSON Payload" which contains necessary data like your email and the current URL.
     - You will be provided with the full "Webpage Content (HTML)".
+    {additional_context}
 
     **Example Scenario:**
     - If the page says "Transcribe the audio to find the password" and provides an `<audio src="file.opus">` tag, your `fetch_url` should be the absolute URL to `file.opus` and the `processing_task` should be "transcribe_audio_to_find_the_password".
@@ -219,31 +261,34 @@ def process_audio_with_gemini(audio_content: bytes, processing_task: str):
     return json.dumps({"processed_data": response.text.strip()})
 
 if __name__ == "__main__":
-    try:
-        input_data = json.load(sys.stdin)
-        task = input_data.get("task")
+    async def main_async():
+        try:
+            input_data = json.load(sys.stdin)
+            task = input_data.get("task")
 
-        if task == "generate_plan":
-            result_json = generate_plan(input_data["quiz_content"], input_data["initial_payload"])
-            print(result_json)
-        
-        elif task == "extract_answer":
-            result_json = extract_answer(input_data["content"], input_data["question"])
-            print(result_json)
+            if task == "generate_plan":
+                result_json = await generate_plan(input_data["quiz_content"], input_data["initial_payload"], input_data.get("media_urls"))
+                print(result_json)
             
-        elif task == "process_data":
-            result_json = process_data(input_data["data_content"], input_data["processing_task"])
-            print(result_json)
-        
-        elif task == "process_audio_with_gemini":
-            audio_content_base64 = input_data["audio_content"]
-            audio_bytes = base64.b64decode(audio_content_base64)
-            result_json = process_audio_with_gemini(audio_bytes, input_data["processing_task"])
-            print(result_json)
+            elif task == "extract_answer":
+                result_json = extract_answer(input_data["content"], input_data["question"])
+                print(result_json)
+                
+            elif task == "process_data":
+                result_json = process_data(input_data["data_content"], input_data["processing_task"])
+                print(result_json)
+            
+            elif task == "process_audio_with_gemini":
+                audio_content_base64 = input_data["audio_content"]
+                audio_bytes = base64.b64decode(audio_content_base64)
+                result_json = process_audio_with_gemini(audio_bytes, input_data["processing_task"])
+                print(result_json)
 
-        else:
-            raise ValueError(f"Unknown task: {task}")
-        
-    except Exception as e:
-        print(json.dumps({"error": str(e)}), file=sys.stderr)
-        sys.exit(1)
+            else:
+                raise ValueError(f"Unknown task: {task}")
+            
+        except Exception as e:
+            print(json.dumps({"error": str(e)}), file=sys.stderr)
+            sys.exit(1)
+
+    asyncio.run(main_async())
