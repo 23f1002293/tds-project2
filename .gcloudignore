@@ -19,3 +19,6 @@ test_app/
 *.md
 .DS_Store
 .vscode/
+data.csv
+temp_file.csv
+test.py

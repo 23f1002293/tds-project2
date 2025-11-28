@@ -153,7 +153,7 @@ async def homepage(request):
         return JSONResponse({"error": "Invalid secret"}, status_code=403)
 
     # Increased timeout from 60.0s to 540.0s (9 minutes) for long Playwright/HTTP operations
-    timeout = httpx.Timeout(540.0) 
+    timeout = httpx.Timeout(200.0) 
     async with httpx.AsyncClient(timeout=timeout) as client:
         while current_url:
             task_counter += 1

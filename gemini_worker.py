@@ -71,8 +71,8 @@ def get_gemini_model(model_name: str = None):
                         latest_version = version
                         model_to_use = model.name
         if not model_to_use:
-            logging.error("Could not find a suitable Gemini Pro model.")
-            raise RuntimeError("Could not find a suitable Gemini Pro model.")
+            logging.error("Could not find a suitable Gemini pro model.")
+            raise RuntimeError("Could not find a suitable Gemini pro model.")
         logging.info(f"Selected Gemini model: {model_to_use}")
     
     logging.info(f"Initializing Gemini model: {model_to_use}")
