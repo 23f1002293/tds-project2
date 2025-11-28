@@ -6,3 +6,10 @@ uvicorn
 python-multipart
 tenacity
 beautifulsoup4
+pandas
+numpy
+scipy
+fastapi
+pydantic
+requests
+

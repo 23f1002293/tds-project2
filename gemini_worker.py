@@ -50,11 +50,11 @@ def get_gemini_model(model_name: str = None):
         logging.info(f"Attempting to use specified Gemini model: {model_name}")
         try:
             model_info = genai.get_model(model_name)
-            if 'generateContent' not in model_info.supported_generation_methods:
+            if 'generateContent' in model_info.supported_generation_methods:
+                model_to_use = model_name
+            else:
                 logging.warning(f"Model {model_name} does not support generateContent. Falling back to default selection.")
                 model_name = None # Fallback to default selection below
-            else:
-                model_to_use = model_name
         except Exception as e:
             logging.warning(f"Could not get model {model_name}. Falling back to default selection. Error: {e}")
             model_name = None
@@ -134,25 +134,31 @@ async def generate_plan(quiz_content: str, initial_payload: dict, media_urls: li
 
     1.  **Analyze the Entire Context:** Read the text, look at all links (`<a>` tags), and identify any embedded media (`<audio>`, `<video>`). The solution may require combining information from the text with data from a linked file (e.g., a CSV, PDF) or transcribed media.
     2.  **Determine the Primary Action:** Decide on the single most important action needed to solve the task. This usually involves fetching and processing data from a URL.
-    3.  **Formulate a Plan:** Respond ONLY with a JSON object with a single key "plan". This object must contain:
-        *   `task_type`: Usually "fetch_and_submit" if you need to get data from a URL.
-        *   `fetch_url`: The single, most relevant URL to fetch for this step of the task. This could be an audio file for transcription, a CSV for calculation, a PDF for information extraction, etc.
-        *   `processing_task`: A concise description of what needs to be done with the data from `fetch_url` to find the answer. 
-            *CRITICAL*: If this task involves a *numerical computation* (e.g., summing, counting, averaging numbers in a file), the `processing_task` MUST follow a precise, machine-readable format for local processing. Examples:
-            - For summing CSV values greater than a threshold: `sum_csv_values_greater_than_<NUMBER>` (e.g., `sum_csv_values_greater_than_17660`)
-            - For other computational tasks, define a similarly structured, explicit format. If no specific local processor exists yet, default to `extract_value_X_from_content`.
-            For non-computational tasks (e.g., audio transcription, general text extraction), use a descriptive phrase like "transcribe_audio_to_find_the_secret_code" or "find_the_name_of_the_CEO_in_the_PDF".
-        *   `submit_url`: The full URL where the final answer should be POSTed.
-        *   `payload`: The JSON payload for the submission, using "__ANSWER__" as a placeholder for the result of the `processing_task`.
+    3.  **Code Execution (STRICTLY FOR COMPUTATION/DATA MANIPULATION):**
+        * **Use the Python Code Block:** ONLY use the `"execute_python_code:"` format for tasks requiring custom Python logic, numerical calculation, data filtering/aggregation (e.g., summing columns in a CSV, complex regex on a large text blob). The execution environment has modules like `pandas`, `numpy`, `csv`, `io`, and `BeautifulSoup` available.
+        * **CSV Processing Note:** When using `pandas.read_csv`, be aware that the first row is often data, not a header. To ensure all rows are included in calculations, load the data without assuming a header (e.g., use `header=None` and reference columns by index like `df[0]`).
+        * **Do NOT Use the Python Code Block:** Do NOT use the `"execute_python_code:"` format for simple extraction or audio transcription.
+
+    4.  **Formulate a Plan:** Respond ONLY with a JSON object with a single key "plan". This object must contain:
+        * `task_type`: This can be "fetch_and_submit" for general data retrieval.
+        * `fetch_url`: The single, most relevant URL to fetch for this step of the task.
+        * `processing_task`: A concise description of the task.
+            
+            *A. COMPUTATIONAL TASK (USE CODE):*
+
+            *B. NON-COMPUTATIONAL TASK (USE STRING):* The `processing_task` must contain ONLY a descriptive phrase.
+            
+            Example: `"transcribe_audio_to_find_the_secret_code"` or `"extract_the_CEO_name_from_the_PDF_content"`
+
+        * `submit_url`: The full URL where the final answer should be POSTed.
+        * `payload`: The JSON payload for the submission, using "__ANSWER__" as a placeholder for the result of the `processing_task`.
+
+    **Security Warning:** Be extremely cautious when generating code. Do not generate code that performs destructive operations, accesses sensitive information, or attempts to bypass security measures. Prioritize safe and predictable code generation.
 
     **Your Context:**
     - You will be provided with the "Initial JSON Payload" which contains necessary data like your email and the current URL.
     - You will be provided with the full "Webpage Content (HTML)".
     {additional_context}
-
-    **Example Scenario:**
-    - If the page says "Transcribe the audio to find the password" and provides an `<audio src="file.opus">` tag, your `fetch_url` should be the absolute URL to `file.opus` and the `processing_task` should be "transcribe_audio_to_find_the_password".
-    - If the page says "Sum the numbers in column 'value' from the attached document" and provides an `<a href="data.csv">` link, your `fetch_url` should be the absolute URL to `data.csv` and the `processing_task` should be "sum_the_numbers_in_column_value_from_the_csv".
 
     Initial JSON Payload (Your context): --- {initial_payload_str} ---
     Webpage Content (Your instructions): --- {quiz_content} ---

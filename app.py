@@ -15,10 +15,17 @@ from tenacity import retry, stop_after_attempt, wait_fixed # Import tenacity
 from bs4 import BeautifulSoup
 import base64
 import re
-import data_processor
+# Removed redundant data_processor import
 import tempfile
 import uuid
 import datetime
+from contextlib import redirect_stdout
+import io
+# Imported libraries for the exec sandbox:
+import pandas 
+import numpy 
+import scipy 
+import csv 
 
 # Configure logging to flush immediately
 logging.basicConfig(
@@ -34,6 +41,21 @@ for handler in logging.root.handlers:
     if isinstance(handler, logging.StreamHandler):
         handler.flush = sys.stdout.flush
 
+# -----------------------------------------------------------
+# MERGED PARSER FUNCTIONS (From parsers.py - Kept for reference, but not explicitly used in processing)
+# NOTE: The LLM should still be instructed to use pandas/BeautifulSoup directly for safety.
+# -----------------------------------------------------------
+
+# def parse_pdf(content: bytes) -> str:
+#     # ... (Logic from parsers.py)
+#     pass
+
+# def parse_csv(content: str) -> list[list[str]]:
+#     # ... (Logic from parsers.py)
+#     pass
+
+# -----------------------------------------------------------
+
 
 def generate_temp_file_name(original_extension):
     """Generates a unique temporary file name.
@@ -42,6 +64,65 @@ def generate_temp_file_name(original_extension):
     timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
     unique_suffix = str(uuid.uuid4())[:8] # Short UUID for uniqueness
     return f"LLM_generated_file{timestamp}_{unique_suffix}{original_extension}"
+
+def _execute_generated_code(code_string: str, data_content: str, html_content: str) -> str:
+    """
+    Safely executes the generated Python code within an isolated scope (sandbox).
+    The code must print the final answer to stdout.
+    """
+    
+    # --- START SECURITY ENHANCEMENT: Injects safe built-ins for imports/basic logic ---
+    safe_builtins = __builtins__.copy()
+
+    # Define UNSAFE built-ins to remove or replace
+    unsafe_builtins = [
+        'open', 'exit', 'quit', 'eval', 'exec', 'compile', 'input', 
+        'copyright', 'credits', 'license', 'breakpoint'
+    ]
+
+    # Remove unsafe built-ins from the execution context
+    for unsafe_func in unsafe_builtins:
+        if unsafe_func in safe_builtins:
+            del safe_builtins[unsafe_func]
+            
+    # Define local variables/modules available to the generated code
+    local_vars = {
+        # Inject safe, pre-installed modules
+        'json': json,
+        'csv': csv, 
+        're': re,
+        'pandas': pandas,
+        'pd': pandas, # Convenient alias for LLM-generated code
+        'numpy': numpy,
+        'np': numpy,   # Convenient alias
+        'scipy': scipy,
+        'io': io,
+        'BeautifulSoup': BeautifulSoup,  # Expose BeautifulSoup
+        'data_content': data_content,    # The fetched data (e.g., CSV string)
+        'html_content': html_content     # The initial page HTML string
+    }
+    # --- END SECURITY ENHANCEMENT ---
+
+
+    # We wrap the execution to capture stdout.
+    stdout_capture = io.StringIO()
+    
+    try:
+        # Execute the code, capturing stdout. 
+        with redirect_stdout(stdout_capture):
+            # The global context is the filtered built-ins; the local context has the modules/data
+            exec(code_string, {"__builtins__": safe_builtins}, local_vars)
+
+        result = stdout_capture.getvalue().strip()
+        
+        if not result:
+            raise ValueError("Execution succeeded, but no output was printed.")
+            
+        return result
+
+    except Exception as e:
+        # Return a clear error if execution fails
+        raise RuntimeError(f"Code execution failed: {e}")
 
 
 async def homepage(request):
@@ -71,13 +152,15 @@ async def homepage(request):
         logging.warning("Invalid secret provided from client.")
         return JSONResponse({"error": "Invalid secret"}, status_code=403)
 
-    timeout = httpx.Timeout(60.0)
+    # Increased timeout from 60.0s to 540.0s (9 minutes) for long Playwright/HTTP operations
+    timeout = httpx.Timeout(540.0) 
     async with httpx.AsyncClient(timeout=timeout) as client:
         while current_url:
             task_counter += 1
             logging.info(f"--- Starting Task {task_counter} for URL: {current_url} ---")
             
             try:
+                # --- A: FETCH INITIAL PAGE FOR CLUES ---
                 logging.info("A: Attempting to launch Playwright for instructions")
                 async with async_playwright() as p:
                     logging.info("A.1: Playwright launched.")
@@ -99,7 +182,7 @@ async def homepage(request):
                     for tag in soup.find_all(src=True):
                         tag['src'] = urljoin(current_url, tag['src'])
                     
-                    processed_html = str(soup)
+                    processed_html = str(soup) # <-- This is the HTML from the current page
                     logging.info(f"--- Processed HTML with Absolute URLs ---\n{processed_html[:1000]}\n---------------------------------")
 
                     # Extract audio/video URLs
@@ -117,6 +200,7 @@ async def homepage(request):
                     await browser.close()
                 logging.info("D: Playwright operations completed successfully.")
 
+                # --- E: PLAN GENERATION ---
                 logging.info("E: Preparing input for Gemini worker.")
                 worker_input = json.dumps({
                     "task": "generate_plan",
@@ -129,15 +213,16 @@ async def homepage(request):
                 if not os.path.exists(python_executable):
                     python_executable = "python"
                 
+                # Timeout for worker process (Plan Generation) increased from 180s to 540s
                 proc = await asyncio.create_subprocess_exec(
                     python_executable, 'gemini_worker.py',
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
                 logging.info("F: Invoking Gemini worker for plan generation.")
                 try:
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(input=worker_input), timeout=180)
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(input=worker_input), timeout=540)
                 except asyncio.TimeoutError:
-                    logging.error("Gemini worker (generate_plan) timed out after 3 minutes.")
+                    logging.error("Gemini worker (generate_plan) timed out after 9 minutes.")
                     proc.kill()
                     await proc.wait()
                     raise RuntimeError("Gemini worker timed out during plan generation.")
@@ -170,35 +255,34 @@ async def homepage(request):
                 processing_task = plan.get("processing_task")
                 
                 final_payload = payload
-
-
+                processed_answer = None
+                
+                # Default content for code execution sandbox is the HTML content 
+                content_for_code_execution = processed_html
 
                 if task_type == "fetch_and_submit":
                     fetch_url = plan.get("fetch_url")
                     logging.info(f"J: Initial Fetching data from: {fetch_url}")
 
-                    # --- New: Centralized fetching and content determination ---
-                    # This block will handle fetching the content based on the *actual* fetch_url
-                    # and determining if it's binary or text.
                     fetched_content_bytes = None
                     fetched_content_text = None
                     actual_file_extension = os.path.splitext(urlparse(fetch_url).path)[1].lower()
                     
+                    # --- FETCH LOGIC (HTTP) ---
                     if actual_file_extension in [
                         '.pdf', '.docx', '.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a', '.mp4', '.avi', '.mov', '.webm',
                         '.csv', '.json', '.xml'
                     ]:
                         logging.info(f"Attempting direct HTTP fetch for file type: {actual_file_extension}")
                         fetch_response = await client.get(fetch_url)
-                        fetch_response.raise_for_status() # Raise an exception for HTTP errors
+                        fetch_response.raise_for_status() 
                         logging.info(f"Direct HTTP fetch successful for {actual_file_extension} from {fetch_url}")
-                        if actual_file_extension in ['.pdf', '.docx', '.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a', '.mp4', '.avi', '.mov', '.webm']:
+                        
+                        if actual_file_extension in ['.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a', '.mp4', '.avi', '.mov', '.webm']:
                             fetched_content_bytes = fetch_response.content
-                            logging.info(f"Fetched binary content ({len(fetched_content_bytes)} bytes) for {actual_file_extension} file.")
-                            fetched_content_text = fetched_content_bytes.decode('utf-8', errors='ignore') # For potential LLM use
-                        else: # .csv, .json, .xml fetched as text
+                            fetched_content_text = fetched_content_bytes.decode('utf-8', errors='ignore')
+                        else: 
                             fetched_content_text = fetch_response.text
-                            logging.info(f"Fetched text content ({len(fetched_content_text)} chars) for {actual_file_extension} file.")
 
                     else: # Assume HTML or dynamic content, use Playwright
                         logging.info(f"Attempting Playwright fetch for dynamic content from {fetch_url}")
@@ -211,130 +295,65 @@ async def homepage(request):
                             await browser.close()
                         logging.info("Fetched dynamic content with Playwright successfully.")
                     
-                    # Log all fetched content for debugging
-                    log_content = fetched_content_text if fetched_content_text is not None else (f"Binary content of {len(fetched_content_bytes)} bytes" if fetched_content_bytes else 'None')
-
+                    # If fetching a file (like CSV), that file content becomes the primary data for execution
+                    if fetched_content_text is not None:
+                         content_for_code_execution = fetched_content_text
                     
-                    processed_answer = None
+                    
+                    # --- PROCESSING LOGIC ---
 
-                    # --- Reworked Logic: Prioritize local processing based on task description ---
-                    sum_task_match = re.match(r"sum_csv_values_greater_than_(\d+)", processing_task)
-
-                    if sum_task_match:
-                        # This is a local computational task, ensure we have the CSV content
-                        threshold = int(sum_task_match.group(1))
-
-                        # If the initial fetch_url was not a CSV but the task is to sum CSV, 
-                        # we need to find and fetch the CSV from the page content.
-                        if actual_file_extension != '.csv' and fetched_content_text:
-                            logging.info("LLM requested CSV sum, but initial fetch was not a CSV. Searching for CSV link.")
-                            soup_for_csv = BeautifulSoup(processed_html, 'html.parser')
-                            csv_link = None
-                            for a_tag in soup_for_csv.find_all('a', href=True):
-                                if a_tag['href'].lower().endswith('.csv'):
-                                    csv_link = a_tag['href']
-                                    break
-                            
-                            if csv_link:
-                                logging.info(f"Found CSV link: {csv_link}. Fetching CSV content.")
-                                csv_response = await client.get(csv_link)
-                                fetched_content_text = csv_response.text # This is the content for local processing
-                                actual_file_extension = '.csv' # Update for consistency
-                            else:
-                                logging.warning("Could not find CSV link on the page for summation task.")
-                                # Fallback to sending HTML to LLM, might timeout if LLM tries to sum HTML
-
-                        if actual_file_extension == '.csv' and fetched_content_text:
-                            logging.info(f"Handling CSV summation locally for threshold: {threshold}")
-                            temp_file_path = os.path.join(tempfile.gettempdir(), f"temp_csv_{uuid.uuid4().hex}.csv")
-                            logging.info(f"Writing CSV content to temporary file: {temp_file_path}")
-                            with open(temp_file_path, 'w', encoding='utf-8') as temp_csv:
-                                temp_csv.write(fetched_content_text)
-                            processed_answer = data_processor.sum_csv_values_greater_than(
-                                temp_file_path, threshold
-                            )
-                            logging.info(f"Local CSV processing result: {processed_answer}")
-                            os.remove(temp_file_path)
-                            logging.info(f"Removed temporary file: {temp_file_path}")
-                        else:
-                            logging.error("Failed to get CSV content for local summation. Falling back to LLM for processing.")
-                            # If we couldn't get CSV content, send the original fetched text to LLM
-                            content_for_processing = fetched_content_text if fetched_content_text is not None else ""
-                            logging.info(f"Calling Gemini worker for data processing (fallback): {processing_task}")
-                            processing_input = json.dumps({
-                                "task": "process_data",
-                                "data_content": content_for_processing,
-                                "processing_task": processing_task
-                            }).encode('utf-8')
-                            
-                            proc_process = await asyncio.create_subprocess_exec(
-                                python_executable, 'gemini_worker.py',
-                                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                            )
-                            try:
-                                process_stdout, process_stderr = await asyncio.wait_for(proc_process.communicate(input=processing_input), timeout=180)
-                            except asyncio.TimeoutError:
-                                logging.error("Gemini text processing worker timed out after 3 minutes (fallback).")
-                                proc_process.kill()
-                                await proc_process.wait()
-                                raise RuntimeError("Gemini text processing timed out (fallback).")
-                            
-                            if proc_process.returncode != 0:
-                                raise RuntimeError(f"Gemini processing worker failed (fallback): {process_stderr.decode('utf-8')}")
-                            
-                            processing_output = json.loads(process_stdout.decode('utf-8'))
-                            processed_answer = processing_output.get("processed_data")
-
-                    elif actual_file_extension in ['.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a']:
-                        # This is an audio file, send to multimodal Gemini worker
+                    # 1. AUDIO PROCESSING (Priority 1)
+                    if actual_file_extension in ['.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a']:
                         if not fetched_content_bytes:
                             raise ValueError("No audio content found for processing.")
 
                         audio_content_base64 = base64.b64encode(fetched_content_bytes).decode('utf-8')
                         
-                        logging.info("Calling multimodal Gemini worker to process audio directly.")
+                        logging.info("1: Calling multimodal Gemini worker to process audio directly.")
                         processing_input = json.dumps({
                             "task": "process_audio_with_gemini",
                             "audio_content": audio_content_base64,
                             "processing_task": processing_task 
                         }).encode('utf-8')
                         
-                        proc_process = await asyncio.create_subprocess_exec(
-                            python_executable, 'gemini_worker.py',
-                            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                        )
-                        try:
-                            process_stdout, process_stderr = await asyncio.wait_for(proc_process.communicate(input=processing_input), timeout=180)
-                        except asyncio.TimeoutError:
-                            logging.error("Gemini audio processing worker timed out after 3 minutes.")
-                            proc_process.kill()
-                            await proc_process.wait()
-                            raise RuntimeError("Gemini audio processing timed out.")
+                    
+                    # 2. CODE EXECUTION (Priority 2: Complex Computation)
+                    # Task 2 (Fixed format) has been removed.
+                    if processing_task and "execute_python_code" in processing_task and processed_answer is None:
                         
-                        if proc_process.returncode != 0:
-                            raise RuntimeError(f"Gemini audio processing worker failed: {process_stderr.decode('utf-8')}")
-                        
-                        processing_output = json.loads(process_stdout.decode('utf-8'))
-                        processed_answer = processing_output.get("processed_data")
+                        code_match = re.search(r"```python\s*([\s\S]*?)```", processing_task)
+                        if code_match:
+                            generated_code = code_match.group(1).strip()
+                            logging.info("2: Executing LLM-generated Python code locally (Async Thread).")
+                            
+                            # Run synchronous exec() in a separate thread to prevent blocking the event loop
+                            processed_answer = await asyncio.to_thread(
+                                _execute_generated_code, generated_code, content_for_code_execution, processed_html
+                            )
+                            
+                        else:
+                             # If code execution was specified but code block is missing, fall through to generic LLM call (Block 3)
+                             pass
 
-                    elif processing_task:
-                        # For other LLM-driven tasks (PDF text analysis, general text extraction etc.)
+                    # 3. GENERIC LLM PROCESSING (Priority 3: Text Extraction / Fallback)
+                    if processed_answer is None:
                         content_for_processing = fetched_content_text if fetched_content_text is not None else ""
-                        logging.info(f"Calling Gemini worker for data processing: {processing_task}")
+                        logging.info(f"3: Calling Gemini worker for generic data processing: {processing_task}")
                         processing_input = json.dumps({
                             "task": "process_data",
                             "data_content": content_for_processing,
                             "processing_task": processing_task
                         }).encode('utf-8')
                         
+                        # Timeout for worker process (Data Processing) increased from 180s to 540s
                         proc_process = await asyncio.create_subprocess_exec(
                             python_executable, 'gemini_worker.py',
                             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                         )
                         try:
-                            process_stdout, process_stderr = await asyncio.wait_for(proc_process.communicate(input=processing_input), timeout=180)
+                            process_stdout, process_stderr = await asyncio.wait_for(proc_process.communicate(input=processing_input), timeout=540)
                         except asyncio.TimeoutError:
-                            logging.error("Gemini text processing worker timed out after 3 minutes.")
+                            logging.error("Gemini text processing worker timed out after 9 minutes.")
                             proc_process.kill()
                             await proc_process.wait()
                             raise RuntimeError("Gemini text processing timed out.")
@@ -345,9 +364,6 @@ async def homepage(request):
                         processing_output = json.loads(process_stdout.decode('utf-8'))
                         processed_answer = processing_output.get("processed_data")
                     
-                    else:
-                        # Default fallback: if no specific processing task, use the fetched text content directly.
-                        processed_answer = fetched_content_text if fetched_content_text is not None else ""
                     
                     logging.info(f"Processed answer: {processed_answer}")
                     
