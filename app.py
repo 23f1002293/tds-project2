@@ -90,7 +90,7 @@ async def homepage(request):
                     logging.info("C: Navigation complete. Retrieving page content.")
                     page_content = await page.content()
                     logging.info("C.1: Page content retrieved.")
-                    logging.info(f"--- Playwright Scraped Content (Original) ---\n{page_content[:1000]}\n---------------------------------")
+
                     
                     # Pre-process HTML to resolve relative URLs
                     soup = BeautifulSoup(page_content, 'html.parser')
@@ -213,7 +213,7 @@ async def homepage(request):
                     
                     # Log all fetched content for debugging
                     log_content = fetched_content_text if fetched_content_text is not None else (f"Binary content of {len(fetched_content_bytes)} bytes" if fetched_content_bytes else 'None')
-                    logging.info(f"--- Fetched content for processing (raw) ---\n{log_content[:500]}\n------------------------------------")
+
                     
                     processed_answer = None
 
