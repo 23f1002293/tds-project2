@@ -41,3 +41,6 @@ uvicorn==0.38.0
 pypdf
 python-docx
 lxml
+SpeechRecognition
+pydub
+tenacity

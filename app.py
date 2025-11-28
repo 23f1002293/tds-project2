@@ -10,6 +10,9 @@ from playwright.async_api import async_playwright
 import httpx
 import mimetypes # For file type detection
 from urllib.parse import urlparse
+import speech_recognition as sr
+from pydub import AudioSegment
+from tenacity import retry, stop_after_attempt, wait_fixed # Import tenacity
 
 import parsers
 import data_processor
@@ -17,9 +20,40 @@ import data_processor
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+async def transcribe_audio(audio_content_bytes: bytes, audio_format: str) -> str:
+    """Transcribes audio content to text."""
+    recognizer = sr.Recognizer()
+    temp_audio_file = f"/tmp/audio_to_transcribe.{audio_format}"
+    temp_wav_file = "/tmp/audio_to_transcribe.wav"
+
+    try:
+        # Save the audio content to a temporary file
+        with open(temp_audio_file, "wb") as f:
+            f.write(audio_content_bytes)
+        
+        # Convert to WAV using pydub, as SpeechRecognition prefers WAV
+        audio = AudioSegment.from_file(temp_audio_file, format=audio_format)
+        audio.export(temp_wav_file, format="wav")
+
+        with sr.AudioFile(temp_wav_file) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data) # Using Google Web Speech API
+            logging.info(f"Transcribed audio: {text}")
+            return text
+    except Exception as e:
+        logging.error(f"Error during audio transcription: {e}")
+        return f"Transcription Error: {e}"
+    finally:
+        # Clean up temporary files
+        if os.path.exists(temp_audio_file):
+            os.remove(temp_audio_file)
+        if os.path.exists(temp_wav_file):
+            os.remove(temp_wav_file)
+
 async def homepage(request):
     logging.info("Homepage endpoint called")
     results = []
+    task_counter = 0
     
     try:
         data = await request.json()
@@ -38,26 +72,29 @@ async def homepage(request):
         logging.warning("Invalid secret provided")
         return JSONResponse({"error": "Invalid secret"}, status_code=403)
 
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         while current_url:
-            logging.info(f"--- Starting new iteration for URL: {current_url} ---")
+            task_counter += 1
+            logging.info(f"--- Starting Task {task_counter} for URL: {current_url} ---")
             
             try:
-                logging.info("A: Launching Playwright")
+                logging.info("A: Launching Playwright for instructions")
                 async with async_playwright() as p:
                     browser = await p.chromium.launch()
                     page = await browser.new_page()
                     logging.info(f"B: Navigating to URL: {current_url}")
                     await page.goto(current_url, wait_until='domcontentloaded')
                     logging.info("C: Navigation complete")
-                    body_text = await page.locator('body').text_content()
-                    logging.info(f"--- Playwright Scraped Content ---\n{body_text}\n---------------------------------")
+                    page_content = await page.content()
+                    logging.info(f"--- Playwright Scraped Content ---\n{page_content}\n---------------------------------")
                     await browser.close()
                 logging.info("D: Playwright operations completed successfully")
 
-                logging.info("E: Calling Gemini worker script")
+                logging.info("E: Calling Gemini worker for a plan")
                 worker_input = json.dumps({
-                    "quiz_content": body_text.strip(),
+                    "task": "generate_plan",
+                    "quiz_content": page_content.strip(),
                     "initial_payload": {"email": email, "secret": secret, "url": current_url}
                 }).encode('utf-8')
 
@@ -95,11 +132,9 @@ async def homepage(request):
                 task_type = plan.get("task_type")
                 submit_url = plan.get("submit_url")
                 payload = plan.get("payload")
-                processing_task = plan.get("processing_task") # New: Task for data_processor
+                processing_task = plan.get("processing_task")
                 
-                command_output_json = {}
                 final_payload = payload
-                processed_answer = None
 
                 if task_type == "fetch_and_submit":
                     fetch_url = plan.get("fetch_url")
@@ -111,46 +146,94 @@ async def homepage(request):
                     fetched_content_bytes = None
                     fetched_content_text = None
 
-                    # Use httpx for binary files, Playwright for web pages
-                    if file_extension in ['.pdf', '.docx']:
+                    if file_extension in [
+                        '.pdf', '.docx', '.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a', '.mp4', '.avi', '.mov', '.webm',
+                        '.csv', '.json', '.xml'
+                    ]:
                         fetch_response = await client.get(fetch_url)
-                        fetched_content_bytes = fetch_response.content
-                        logging.info(f"Fetched binary content ({len(fetched_content_bytes)} bytes)")
-                    else: # Assume HTML or dynamic content
+                        if file_extension in ['.pdf', '.docx', '.mp3', '.opus', '.wav', '.flac', '.ogg', '.m4a', '.mp4', '.avi', '.mov', '.webm']:
+                            fetched_content_bytes = fetch_response.content
+                            logging.info(f"Fetched binary content ({len(fetched_content_bytes)} bytes) for {file_extension} file.")
+                            # For binary files, text content is derived if needed for LLM, but raw bytes are primary
+                            fetched_content_text = fetched_content_bytes.decode('utf-8', errors='ignore')
+                        else: # .csv, .json, .xml fetched as text
+                            fetched_content_text = fetch_response.text
+                            logging.info(f"Fetched text content ({len(fetched_content_text)} chars) for {file_extension} file.")
+
+                    else: # Assume HTML or dynamic content, use Playwright
                         async with async_playwright() as p:
                             browser = await p.chromium.launch()
                             page = await browser.new_page()
                             await page.goto(fetch_url, wait_until='domcontentloaded')
                             fetched_content_text = await page.locator('body').text_content()
+                            logging.info(f"--- Rendered content of fetch_url ---\n{fetched_content_text}\n------------------------------------ (Playwright)")
                             await browser.close()
-                        logging.info("Fetched dynamic content with Playwright")
+                        logging.info("Fetched dynamic content with Playwright.")
                     
-                    logging.info("K: Fetched data response received")
+                    # Log all fetched content for debugging, as requested
+                    log_content = fetched_content_text if fetched_content_text is not None else (f"Binary content of {len(fetched_content_bytes)} bytes" if fetched_content_bytes else 'None')
+                    logging.info(f"--- Fetched content for processing (raw) ---\n{log_content[:500]}\n------------------------------------")
+                    
+                    processed_answer = None
+                    if processing_task == "transcribe_audio":
+                        if not fetched_content_bytes:
+                            raise ValueError("No audio content found for transcription.")
 
-                    # Parse content based on file type
-                    if file_extension == '.pdf' and fetched_content_bytes:
-                        parsed_content = parsers.parse_pdf(fetched_content_bytes)
-                    elif file_extension == '.docx' and fetched_content_bytes:
-                        parsed_content = parsers.parse_docx(fetched_content_bytes)
-                    elif file_extension == '.json':
-                        parsed_content = parsers.parse_json(fetched_content_text)
-                    elif file_extension == '.xml':
-                        parsed_content = parsers.parse_xml(fetched_content_text)
-                    elif file_extension == '.csv':
-                        parsed_content = parsers.parse_csv(fetched_content_text)
+                        audio_format = file_extension.lstrip('.')
+                        if not audio_format:
+                            content_type_from_header = fetch_response.headers.get('content-type') if 'fetch_response' in locals() else None
+                            if content_type_from_header and 'audio/' in content_type_from_header:
+                                audio_format = content_type_from_header.split('/')[-1] 
+                            else:
+                                logging.warning(f"Could not determine audio format for {fetch_url}, defaulting to 'opus'.")
+                                audio_format = 'opus' 
+
+                        transcribed_text = await transcribe_audio(fetched_content_bytes, audio_format)
+                        logging.info(f"Transcribed audio: {transcribed_text}")
+
+                        logging.info("Calling Gemini worker to process transcribed audio.")
+                        processing_input = json.dumps({
+                            "task": "process_data",
+                            "data_content": transcribed_text,
+                            "processing_task": "extract_clue_from_transcript" 
+                        }).encode('utf-8')
+
+                        proc_process = await asyncio.create_subprocess_exec(
+                            python_executable, 'gemini_worker.py',
+                            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                        )
+                        process_stdout, process_stderr = await proc_process.communicate(input=processing_input)
+                        if proc_process.returncode != 0:
+                            raise RuntimeError(f"Gemini processing worker failed with transcribed audio: {process_stderr.decode('utf-8')}")
+
+                        processing_output = json.loads(process_stdout.decode('utf-8'))
+                        processed_answer = processing_output.get("processed_data")
+
+                    elif processing_task:
+                        # For other processing tasks, use the fetched text content.
+                        content_for_processing = fetched_content_text if fetched_content_text is not None else ""
+                        logging.info(f"Calling Gemini worker for data processing: {processing_task}")
+                        processing_input = json.dumps({
+                            "task": "process_data",
+                            "data_content": content_for_processing,
+                            "processing_task": processing_task
+                        }).encode('utf-8')
+                        
+                        proc_process = await asyncio.create_subprocess_exec(
+                            python_executable, 'gemini_worker.py',
+                            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                        )
+                        process_stdout, process_stderr = await proc_process.communicate(input=processing_input)
+                        if proc_process.returncode != 0:
+                            raise RuntimeError(f"Gemini processing worker failed: {process_stderr.decode('utf-8')}")
+                        
+                        processing_output = json.loads(process_stdout.decode('utf-8'))
+                        processed_answer = processing_output.get("processed_data")
+
                     else:
-                        parsed_content = fetched_content_text # Default to text
-
-                    logging.info(f"Fetched and parsed content (type: {type(parsed_content)}): {str(parsed_content)[:200]}...")
-
-                    # Apply processing task if specified
-                    if processing_task == "sum_numbers_in_csv":
-                        processed_answer = data_processor.sum_numbers_in_csv(fetched_content_text)
-                    elif processing_task == "extract_secret_code" and isinstance(parsed_content, str):
-                        processed_answer = data_processor.extract_secret_code(parsed_content)
-                    else:
-                        processed_answer = parsed_content
-
+                        # Default fallback: if no specific processing task, use appropriate fetched text content
+                        processed_answer = fetched_content_text if fetched_content_text is not None else ""
+                    
                     logging.info(f"Processed answer: {processed_answer}")
                     
                     def replace_placeholder(p, answer):
@@ -164,22 +247,27 @@ async def homepage(request):
                             return p
                     
                     final_payload = replace_placeholder(payload, processed_answer)
-                    logging.info(f"L: Submitting final payload: {final_payload} to {submit_url}")
-                    response = await client.post(submit_url, json=final_payload)
-                    logging.info("M: Submission response received")
-                    command_output_json = response.json()
 
-                elif task_type == "single_post":
-                    logging.info(f"L: Submitting payload: {payload} to {submit_url}")
-                    response = await client.post(submit_url, json=payload)
-                    logging.info("M: Submission response received")
-                    command_output_json = response.json()
+                # Centralized submission logic with retry
+                logging.info(f"L: Submitting final payload: {json.dumps(final_payload)} to {submit_url}")
+
+                @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), reraise=True)
+                async def post_with_retry():
+                    try:
+                        logging.info(f"Attempting POST to {submit_url}...")
+                        return await client.post(submit_url, json=final_payload)
+                    except httpx.RemoteProtocolError as e:
+                        logging.warning(f"Caught RemoteProtocolError, retrying... Error: {e}")
+                        raise
                 
-                else:
-                    raise ValueError(f"Unknown task type: {task_type}")
+                response = await post_with_retry()
+                
+                logging.info("M: Submission response received")
+                command_output_json = response.json()
 
                 logging.info(f"N: Submission successful. Response: {command_output_json}")
                 iteration_result = {
+                    "task_number": task_counter,
                     "url_processed": current_url,
                     "llm_plan": plan,
                     "final_payload": final_payload,
@@ -190,17 +278,17 @@ async def homepage(request):
                 current_url = command_output_json.get("url")
 
             except Exception as e:
-                logging.error(f"An error occurred during iteration for {current_url}: {e}")
+                logging.error(f"An error occurred during Task {task_counter} for {current_url}: {e}")
                 traceback.print_exc()
-                results.append({"url_processed": current_url, "error": str(e)})
-                current_url = None # Stop the loop
+                results.append({"task_number": task_counter, "url_processed": current_url, "error": str(e)})
+                current_url = None
     
     logging.info("--- Workflow finished ---")
     return JSONResponse({
         "message": "Workflow complete",
+        "tasks_completed": task_counter,
         "results": results
     }, status_code=200)
-
 
 routes = [
     Route("/", homepage, methods=["POST"]),
