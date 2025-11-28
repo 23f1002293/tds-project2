@@ -7,7 +7,7 @@ import string
 
 # --- Configuration ---
 # The URL of the main application server
-SERVER_URL = "http://127.0.0.1:8000/"
+SERVER_URL = "https://ai-agent-service-501867304737.us-central1.run.app"
 # A valid email and URL to use for successful requests
 VALID_EMAIL = "23f1002293@ds.study.iitm.ac.in"
 VALID_URL = "https://tds-llm-analysis.s-anand.net/demo"
