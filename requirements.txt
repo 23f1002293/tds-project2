@@ -4,6 +4,7 @@ httpx
 starlette
 uvicorn
 python-multipart
+pythondotenv
 tenacity
 beautifulsoup4
 pandas
