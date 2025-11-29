@@ -108,6 +108,7 @@ def _execute_generated_code(code_string: str, data_content: str, html_content: s
     stdout_capture = io.StringIO()
     
     try:
+        logging.info(f"--- EXECUTING GENERATED PYTHON CODE ---\n{code_string}\n---------------------------------------")
         # Execute the code, capturing stdout. 
         with redirect_stdout(stdout_capture):
             # The global context is the filtered built-ins; the local context has the modules/data
@@ -117,7 +118,8 @@ def _execute_generated_code(code_string: str, data_content: str, html_content: s
         
         if not result:
             raise ValueError("Execution succeeded, but no output was printed.")
-            
+        
+        logging.info(f"--- EXECUTION RESULT ---\n{result}\n--------------------------")
         return result
 
     except Exception as e:

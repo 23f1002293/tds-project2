@@ -158,6 +158,7 @@ async def generate_plan(quiz_content: str, initial_payload: dict, media_urls: li
     **Your Context:**
     - You will be provided with the "Initial JSON Payload" which contains necessary data like your email and the current URL.
     - You will be provided with the full "Webpage Content (HTML)".
+    - **Available Python Libraries for `execute_python_code`**: `json`, `csv`, `re`, `pandas` (aliased as `pd`), `numpy` (aliased as `np`), `scipy`, `io`, and `BeautifulSoup`.
     {additional_context}
 
     Initial JSON Payload (Your context): --- {initial_payload_str} ---
